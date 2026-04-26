@@ -1,50 +1,42 @@
 from flask import Flask, request, jsonify
+from db import SessionLocal, engine
+from models import Base, User, Transaction
 import requests, base64, os
 from datetime import datetime
 
+Base.metadata.create_all(bind=engine)
+
 app = Flask(__name__)
 
-# ========= CONFIG =========
 BASE_URL = "https://api.safaricom.co.ke"
 
-CONSUMER_KEY = os.getenv("DARAJA_CONSUMER_KEY")
-CONSUMER_SECRET = os.getenv("DARAJA_CONSUMER_SECRET")
-SHORTCODE = os.getenv("DARAJA_SHORTCODE")
-PASSKEY = os.getenv("DARAJA_PASSKEY")
-CALLBACK_URL = os.getenv("DARAJA_CALLBACK_URL")
-
-# ========= MEMORY (WALLET) =========
-wallets = {}
-payments = {}
-
-# ========= HELPERS =========
 def format_phone(phone):
-    phone = str(phone).replace("+", "").strip()
     if phone.startswith("0"):
         return "254" + phone[1:]
-    if phone.startswith("7"):
-        return "254" + phone
     return phone
 
 def get_token():
-    url = f"{BASE_URL}/oauth/v1/generate?grant_type=client_credentials"
-    r = requests.get(url, auth=(CONSUMER_KEY, CONSUMER_SECRET))
+    r = requests.get(
+        f"{BASE_URL}/oauth/v1/generate?grant_type=client_credentials",
+        auth=(os.getenv("DARAJA_CONSUMER_KEY"), os.getenv("DARAJA_CONSUMER_SECRET"))
+    )
     return r.json()["access_token"]
 
-# ========= DEPOSIT =========
+# ================= DEPOSIT =================
 @app.route("/deposit", methods=["POST"])
 def deposit():
-    data = request.json
-    phone = format_phone(data["phone"])
-    amount = int(data["amount"])
+    phone = format_phone(request.json["phone"])
+    amount = int(request.json["amount"])
 
     token = get_token()
-
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-    password = base64.b64encode((SHORTCODE + PASSKEY + timestamp).encode()).decode()
+
+    password = base64.b64encode(
+        (os.getenv("DARAJA_SHORTCODE") + os.getenv("DARAJA_PASSKEY") + timestamp).encode()
+    ).decode()
 
     payload = {
-        "BusinessShortCode": SHORTCODE,
+        "BusinessShortCode": os.getenv("DARAJA_SHORTCODE"),
         "Password": password,
         "Timestamp": timestamp,
         "TransactionType": "CustomerBuyGoodsOnline",
@@ -52,92 +44,87 @@ def deposit():
         "PartyA": phone,
         "PartyB": "5402532",
         "PhoneNumber": phone,
-        "CallBackURL": CALLBACK_URL,
+        "CallBackURL": os.getenv("DARAJA_CALLBACK_URL"),
         "AccountReference": "HopestonePay",
         "TransactionDesc": "Deposit"
     }
 
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
-    }
+    headers = {"Authorization": f"Bearer {token}"}
 
     r = requests.post(f"{BASE_URL}/mpesa/stkpush/v1/processrequest",
                       json=payload, headers=headers)
 
-    res = r.json()
-    checkout_id = res.get("CheckoutRequestID")
+    return jsonify(r.json())
 
-    payments[checkout_id] = {
-        "phone": phone,
-        "amount": amount,
-        "status": "PENDING"
-    }
-
-    return jsonify({"CheckoutRequestID": checkout_id})
-
-# ========= CALLBACK =========
+# ================= CALLBACK =================
 @app.route("/callback", methods=["POST"])
 def callback():
-    data = request.json
-    stk = data["Body"]["stkCallback"]
+    db = SessionLocal()
 
-    checkout_id = stk["CheckoutRequestID"]
-    result_code = stk["ResultCode"]
+    data = request.json["Body"]["stkCallback"]
 
-    if result_code == 0:
-        items = stk["CallbackMetadata"]["Item"]
+    if data["ResultCode"] == 0:
+        items = data["CallbackMetadata"]["Item"]
 
         amount = next(i["Value"] for i in items if i["Name"] == "Amount")
         phone = str(next(i["Value"] for i in items if i["Name"] == "PhoneNumber"))
+        receipt = next(i["Value"] for i in items if i["Name"] == "MpesaReceiptNumber")
 
-        # update wallet
-        if phone not in wallets:
-            wallets[phone] = 0
+        user = db.query(User).filter(User.phone == phone).first()
 
-        wallets[phone] += amount
+        if not user:
+            user = User(phone=phone, balance=0)
+            db.add(user)
 
-        payments[checkout_id]["status"] = "PAID"
-    else:
-        payments[checkout_id]["status"] = "FAILED"
+        user.balance += amount
+
+        tx = Transaction(
+            phone=phone,
+            amount=amount,
+            type="deposit",
+            status="PAID",
+            receipt=receipt
+        )
+
+        db.add(tx)
+        db.commit()
 
     return jsonify({"ResultCode": 0})
 
-# ========= STATUS =========
-@app.route("/status/<checkout_id>")
-def status(checkout_id):
-    return jsonify(payments.get(checkout_id, {"status": "PENDING"}))
-
-# ========= BALANCE =========
+# ================= BALANCE =================
 @app.route("/balance/<phone>")
 def balance(phone):
-    phone = format_phone(phone)
-    return jsonify({"balance": wallets.get(phone, 0)})
+    db = SessionLocal()
+    user = db.query(User).filter(User.phone == format_phone(phone)).first()
+    return jsonify({"balance": user.balance if user else 0})
 
-# ========= SEND =========
+# ================= SEND =================
 @app.route("/send", methods=["POST"])
 def send():
-    data = request.json
-    sender = format_phone(data["from"])
-    receiver = format_phone(data["to"])
-    amount = int(data["amount"])
+    db = SessionLocal()
 
-    if wallets.get(sender, 0) < amount:
+    sender = format_phone(request.json["from"])
+    receiver = format_phone(request.json["to"])
+    amount = int(request.json["amount"])
+
+    s = db.query(User).filter(User.phone == sender).first()
+    r = db.query(User).filter(User.phone == receiver).first()
+
+    if s.balance < amount:
         return jsonify({"error": "Insufficient balance"}), 400
 
-    wallets[sender] -= amount
+    s.balance -= amount
 
-    if receiver not in wallets:
-        wallets[receiver] = 0
+    if not r:
+        r = User(phone=receiver, balance=0)
+        db.add(r)
 
-    wallets[receiver] += amount
+    r.balance += amount
+
+    db.commit()
 
     return jsonify({"status": "SUCCESS"})
 
-# ========= HEALTH =========
 @app.route("/")
 def home():
-    return "HopestonePay running"
-
-if __name__ == "__main__":
-    app.run()
+    return "REAL HopestonePay running"
