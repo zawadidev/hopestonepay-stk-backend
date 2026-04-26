@@ -1,62 +1,47 @@
 from flask import Flask, request, jsonify
-import requests
-import base64
-import os
+import requests, base64, os
 from datetime import datetime
 
 app = Flask(__name__)
 
-# =========================
-# ENV VARIABLES (Render)
-# =========================
+# ========= CONFIG =========
+BASE_URL = "https://api.safaricom.co.ke"
+
 CONSUMER_KEY = os.getenv("DARAJA_CONSUMER_KEY")
 CONSUMER_SECRET = os.getenv("DARAJA_CONSUMER_SECRET")
-SHORTCODE = os.getenv("DARAJA_SHORTCODE")  # 4567769
+SHORTCODE = os.getenv("DARAJA_SHORTCODE")
 PASSKEY = os.getenv("DARAJA_PASSKEY")
 CALLBACK_URL = os.getenv("DARAJA_CALLBACK_URL")
 
-BASE_URL = "https://api.safaricom.co.ke"
-
-# =========================
-# STORE PAYMENTS (TEMP)
-# =========================
+# ========= MEMORY (WALLET) =========
+wallets = {}
 payments = {}
 
-# =========================
-# FORMAT PHONE (07 -> 2547)
-# =========================
+# ========= HELPERS =========
 def format_phone(phone):
-    phone = str(phone).strip().replace(" ", "")
+    phone = str(phone).replace("+", "").strip()
     if phone.startswith("0"):
         return "254" + phone[1:]
     if phone.startswith("7"):
         return "254" + phone
     return phone
 
-# =========================
-# GET ACCESS TOKEN
-# =========================
 def get_token():
     url = f"{BASE_URL}/oauth/v1/generate?grant_type=client_credentials"
-    response = requests.get(url, auth=(CONSUMER_KEY, CONSUMER_SECRET))
-    return response.json()["access_token"]
+    r = requests.get(url, auth=(CONSUMER_KEY, CONSUMER_SECRET))
+    return r.json()["access_token"]
 
-# =========================
-# STK PUSH ROUTE
-# =========================
-@app.route('/stkpush', methods=['POST'])
-def stkpush():
+# ========= DEPOSIT =========
+@app.route("/deposit", methods=["POST"])
+def deposit():
     data = request.json
-
-    phone = format_phone(data.get("phone"))
-    amount = int(data.get("amount"))
+    phone = format_phone(data["phone"])
+    amount = int(data["amount"])
 
     token = get_token()
 
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
     password = base64.b64encode((SHORTCODE + PASSKEY + timestamp).encode()).decode()
-
-    url = f"{BASE_URL}/mpesa/stkpush/v1/processrequest"
 
     payload = {
         "BusinessShortCode": SHORTCODE,
@@ -65,7 +50,7 @@ def stkpush():
         "TransactionType": "CustomerBuyGoodsOnline",
         "Amount": amount,
         "PartyA": phone,
-        "PartyB": "5402532",  # YOUR TILL NUMBER
+        "PartyB": "5402532",
         "PhoneNumber": phone,
         "CallBackURL": CALLBACK_URL,
         "AccountReference": "HopestonePay",
@@ -77,68 +62,82 @@ def stkpush():
         "Content-Type": "application/json"
     }
 
-    response = requests.post(url, json=payload, headers=headers)
-    res = response.json()
+    r = requests.post(f"{BASE_URL}/mpesa/stkpush/v1/processrequest",
+                      json=payload, headers=headers)
 
-    # Return CLEAN response
-    return jsonify({
-        "CheckoutRequestID": res.get("CheckoutRequestID"),
-        "ResponseCode": res.get("ResponseCode"),
-        "ResponseDescription": res.get("ResponseDescription")
-    })
+    res = r.json()
+    checkout_id = res.get("CheckoutRequestID")
 
-# =========================
-# CALLBACK (FROM SAFARICOM)
-# =========================
-@app.route('/callback', methods=['POST'])
+    payments[checkout_id] = {
+        "phone": phone,
+        "amount": amount,
+        "status": "PENDING"
+    }
+
+    return jsonify({"CheckoutRequestID": checkout_id})
+
+# ========= CALLBACK =========
+@app.route("/callback", methods=["POST"])
 def callback():
     data = request.json
+    stk = data["Body"]["stkCallback"]
 
-    result = data['Body']['stkCallback']
-    checkout_id = result['CheckoutRequestID']
-    result_code = result['ResultCode']
+    checkout_id = stk["CheckoutRequestID"]
+    result_code = stk["ResultCode"]
 
     if result_code == 0:
-        metadata = result['CallbackMetadata']['Item']
+        items = stk["CallbackMetadata"]["Item"]
 
-        receipt = next(i['Value'] for i in metadata if i['Name'] == 'MpesaReceiptNumber')
-        amount = next(i['Value'] for i in metadata if i['Name'] == 'Amount')
-        phone = next(i['Value'] for i in metadata if i['Name'] == 'PhoneNumber')
+        amount = next(i["Value"] for i in items if i["Name"] == "Amount")
+        phone = str(next(i["Value"] for i in items if i["Name"] == "PhoneNumber"))
 
-        payments[checkout_id] = {
-            "status": "PAID",
-            "receipt": receipt,
-            "amount": amount,
-            "phone": phone
-        }
+        # update wallet
+        if phone not in wallets:
+            wallets[phone] = 0
+
+        wallets[phone] += amount
+
+        payments[checkout_id]["status"] = "PAID"
     else:
-        payments[checkout_id] = {
-            "status": "FAILED"
-        }
+        payments[checkout_id]["status"] = "FAILED"
 
     return jsonify({"ResultCode": 0})
 
-# =========================
-# PAYMENT STATUS
-# =========================
-@app.route('/payment-status/<checkout_id>', methods=['GET'])
-def payment_status(checkout_id):
-    payment = payments.get(checkout_id)
+# ========= STATUS =========
+@app.route("/status/<checkout_id>")
+def status(checkout_id):
+    return jsonify(payments.get(checkout_id, {"status": "PENDING"}))
 
-    if not payment:
-        return jsonify({"status": "PENDING"})
+# ========= BALANCE =========
+@app.route("/balance/<phone>")
+def balance(phone):
+    phone = format_phone(phone)
+    return jsonify({"balance": wallets.get(phone, 0)})
 
-    return jsonify(payment)
+# ========= SEND =========
+@app.route("/send", methods=["POST"])
+def send():
+    data = request.json
+    sender = format_phone(data["from"])
+    receiver = format_phone(data["to"])
+    amount = int(data["amount"])
 
-# =========================
-# HEALTH CHECK
-# =========================
-@app.route('/')
+    if wallets.get(sender, 0) < amount:
+        return jsonify({"error": "Insufficient balance"}), 400
+
+    wallets[sender] -= amount
+
+    if receiver not in wallets:
+        wallets[receiver] = 0
+
+    wallets[receiver] += amount
+
+    return jsonify({"status": "SUCCESS"})
+
+# ========= HEALTH =========
+@app.route("/")
 def home():
-    return "HopestonePay STK Backend Running ✅"
+    return "HopestonePay running"
 
-# =========================
-# RUN APP
-# =========================
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run()
