@@ -1,10 +1,12 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 import requests
 import base64
 import os
 from datetime import datetime
 
 app = Flask(__name__)
+CORS(app)
 
 CONSUMER_KEY = os.getenv("DARAJA_CONSUMER_KEY")
 CONSUMER_SECRET = os.getenv("DARAJA_CONSUMER_SECRET")
